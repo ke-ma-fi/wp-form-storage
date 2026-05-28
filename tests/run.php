@@ -188,6 +188,48 @@ try {
     ok('is_known_table: registrierte Tabelle', priv($store, 'is_known_table', $tbl));
     ok('is_known_table: unbekannte Tabelle',  !priv($store, 'is_known_table', 'nicht_vorhanden'));
 
+    // ── Spalten-Einstellungen ──────────────────────────────────────────────────
+    echo "\nSQLite — Spalten-Einstellungen\n";
+
+    // Defaults wenn nichts gespeichert
+    $defaults = priv($store, 'get_col_settings', 'test_form');
+    eq('Defaults: hidden leer',  $defaults['hidden'], []);
+    eq('Defaults: order leer',   $defaults['order'],  []);
+
+    // Roundtrip: speichern + lesen
+    priv($store, 'save_col_settings', 'test_form', [
+        'hidden' => ['nachricht'],
+        'order'  => ['_created_at', 'email', 'nachricht', '_status'],
+    ]);
+    $loaded = priv($store, 'get_col_settings', 'test_form');
+    eq('Roundtrip: hidden korrekt', $loaded['hidden'], ['nachricht']);
+    eq('Roundtrip: order korrekt',  $loaded['order'],  ['_created_at', 'email', 'nachricht', '_status']);
+
+    // Überschreiben (UPSERT)
+    priv($store, 'save_col_settings', 'test_form', [
+        'hidden' => [],
+        'order'  => ['email', '_created_at', '_status'],
+    ]);
+    $updated = priv($store, 'get_col_settings', 'test_form');
+    eq('UPSERT: hidden geleert',    $updated['hidden'], []);
+    eq('UPSERT: order aktualisiert', $updated['order'], ['email', '_created_at', '_status']);
+
+    // Anwendungslogik: Reihenfolge + Hidden auf display_cols anwenden
+    $all_d = ['_created_at', 'email', 'nachricht', '_status'];
+
+    // Saved order anwenden (neue Spalten ans Ende)
+    $saved_o = ['email', '_status', '_created_at'];         // 'nachricht' fehlt → ans Ende
+    $new_c   = array_values(array_diff($all_d, $saved_o));
+    $ordered = array_merge($saved_o, $new_c);
+    eq('Order: fehlende Spalte ans Ende', $ordered, ['email', '_status', '_created_at', 'nachricht']);
+
+    // Hidden anwenden
+    $hidden_c   = ['nachricht', 'email'];
+    $display    = array_values(array_filter($ordered, fn($c) => !in_array($c, $hidden_c, true)));
+    $hidden_vis = array_values(array_filter($ordered, fn($c) =>  in_array($c, $hidden_c, true)));
+    eq('Display: hidden entfernt',      $display,    ['_status', '_created_at']);
+    eq('Pills: nur hidden sichtbar',    $hidden_vis, ['email', 'nachricht']);
+
     // build_where-Ergebnis führt zu korrekten SQL-Abfragen
     $db->exec("INSERT INTO \"test_form\" (email, nachricht, _status) VALUES ('a@b.de', 'Hallo', 'Neu')");
     $db->exec("INSERT INTO \"test_form\" (email, nachricht, _status) VALUES ('c@d.de', '', 'Erledigt')");

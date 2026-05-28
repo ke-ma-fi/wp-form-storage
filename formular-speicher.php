@@ -38,9 +38,10 @@ class CF7_SQLite_Store {
         add_action('wpcf7_save_contact_form', [$this, 'save_editor_panel']);
 
         // Admin
-        add_action('admin_menu',           [$this, 'add_menu']);
-        add_action('admin_post_fs_status', [$this, 'handle_status']);
-        add_action('admin_post_fs_export', [$this, 'handle_export']);
+        add_action('admin_menu',                [$this, 'add_menu']);
+        add_action('admin_post_fs_status',      [$this, 'handle_status']);
+        add_action('admin_post_fs_export',      [$this, 'handle_export']);
+        add_action('wp_ajax_fs_col_settings',   [$this, 'handle_col_settings']);
     }
 
     /* ════════════════════════════════════════════════
@@ -109,6 +110,14 @@ class CF7_SQLite_Store {
                 table_name  TEXT NOT NULL,
                 form_title  TEXT NOT NULL,
                 updated_at  TEXT
+            );
+        ");
+
+        // Einstellungs-Tabelle: persistente Key-Value-Paare (z.B. Spalten-Konfiguration)
+        $this->db->exec("
+            CREATE TABLE IF NOT EXISTS _settings (
+                key   TEXT PRIMARY KEY,
+                value TEXT NOT NULL
             );
         ");
 
@@ -266,6 +275,79 @@ class CF7_SQLite_Store {
             $conditions ? 'WHERE ' . implode(' AND ', $conditions) : '',
             $params,
         ];
+    }
+
+    /* ════════════════════════════════════════════════
+       SPALTEN-EINSTELLUNGEN (Sichtbarkeit & Reihenfolge)
+    ════════════════════════════════════════════════ */
+
+    /** Liest gespeicherte Spalten-Einstellungen für eine Tabelle. */
+    private function get_col_settings(string $table): array {
+        try {
+            $stmt = $this->db()->prepare("SELECT value FROM _settings WHERE key=:k");
+            $stmt->bindValue(':k', "cols.$table");
+            $row = $stmt->execute()->fetchArray(SQLITE3_ASSOC);
+            if (!$row) return ['hidden' => [], 'order' => []];
+            $decoded = json_decode($row['value'], true);
+            return [
+                'hidden' => $decoded['hidden'] ?? [],
+                'order'  => $decoded['order']  ?? [],
+            ];
+        } catch (\Throwable $e) {
+            return ['hidden' => [], 'order' => []];
+        }
+    }
+
+    /** Speichert Spalten-Einstellungen für eine Tabelle. */
+    private function save_col_settings(string $table, array $settings): void {
+        $json = json_encode($settings, JSON_UNESCAPED_UNICODE);
+        $stmt = $this->db()->prepare(
+            "INSERT INTO _settings (key, value) VALUES (:k, :v)
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value"
+        );
+        $stmt->bindValue(':k', "cols.$table");
+        $stmt->bindValue(':v', $json);
+        $stmt->execute();
+    }
+
+    /** AJAX-Handler: speichert neue Spalten-Reihenfolge und Sichtbarkeit. */
+    public function handle_col_settings(): void {
+        check_ajax_referer('fs_col_settings');
+        if (!current_user_can('fs_view_submissions')) wp_die('', '', ['response' => 403]);
+
+        $table = sanitize_text_field($_POST['table'] ?? '');
+        if (!$this->is_known_table($table)) wp_die('', '', ['response' => 400]);
+
+        // Alle darstellbaren Spalten für diese Tabelle ermitteln (Whitelist)
+        $all_db_cols = [];
+        $res = $this->db()->query("PRAGMA table_info(\"$table\")");
+        while ($r = $res->fetchArray(SQLITE3_ASSOC)) $all_db_cols[] = $r['name'];
+        $field_cols    = array_values(array_filter($all_db_cols, fn($c) => !in_array($c, ['id', '_created_at', '_status'], true)));
+        $valid_display = array_merge(['_created_at'], $field_cols, ['_status']);
+
+        // Reihenfolge: nur bekannte Spalten durchlassen
+        $order = [];
+        foreach ((array) ($_POST['order'] ?? []) as $col) {
+            $col = sanitize_key($col);
+            if (in_array($col, $valid_display, true)) $order[] = $col;
+        }
+        // Fehlende Spalten ans Ende hängen (neue Felder seit letztem Save)
+        foreach ($valid_display as $col) {
+            if (!in_array($col, $order, true)) $order[] = $col;
+        }
+
+        // Sichtbarkeit: nur bekannte Spalten, mindestens eine muss sichtbar bleiben
+        $hidden = [];
+        foreach ((array) ($_POST['hidden'] ?? []) as $col) {
+            $col = sanitize_key($col);
+            if (in_array($col, $valid_display, true)) $hidden[] = $col;
+        }
+        while (!empty($hidden) && count($hidden) >= count($order)) {
+            array_pop($hidden);
+        }
+
+        $this->save_col_settings($table, ['hidden' => $hidden, 'order' => $order]);
+        wp_send_json_success();
     }
 
     /* ════════════════════════════════════════════════
@@ -547,10 +629,26 @@ class CF7_SQLite_Store {
         $res = $db->query("PRAGMA table_info(\"$table\")");
         while ($r = $res->fetchArray(SQLITE3_ASSOC)) $all_cols[] = $r['name'];
 
-        $field_cols   = array_values(array_filter($all_cols, fn($c) => !in_array($c, ['id', '_created_at', '_status'], true)));
-        $display_cols = array_merge(['_created_at'], $field_cols, ['_status']);
+        $field_cols  = array_values(array_filter($all_cols, fn($c) => !in_array($c, ['id', '_created_at', '_status'], true)));
+        $all_display = array_merge(['_created_at'], $field_cols, ['_status']); // alle darstellbaren Spalten
 
-        // ── 2. GET-Parameter einlesen & validieren ──
+        // ── 2. Gespeicherte Einstellungen anwenden ──
+        $col_settings = $this->get_col_settings($table);
+        $hidden_cols  = array_values(array_intersect($col_settings['hidden'], $all_display));
+
+        // Gespeicherte Reihenfolge anwenden; neue Spalten ans Ende hängen
+        $saved_order = array_values(array_filter($col_settings['order'], fn($c) => in_array($c, $all_display, true)));
+        if (!empty($saved_order)) {
+            $new_cols    = array_values(array_diff($all_display, $saved_order));
+            $all_display = array_merge($saved_order, $new_cols);
+        }
+
+        // Sichtbare Spalten (ohne versteckte) → für die Tabelle
+        $display_cols   = array_values(array_filter($all_display, fn($c) => !in_array($c, $hidden_cols, true)));
+        // Versteckte Spalten → für die Pills
+        $hidden_display = array_values(array_filter($all_display, fn($c) => in_array($c, $hidden_cols, true)));
+
+        // ── 3. GET-Parameter einlesen & validieren ──
         $search = sanitize_text_field($_GET['s'] ?? '');
         $paged  = max(1, (int) ($_GET['paged'] ?? 1));
 
@@ -565,7 +663,7 @@ class CF7_SQLite_Store {
 
         $has_filters = $search !== '' || count(array_filter($filters)) > 0;
 
-        // ── 3. Kategorische Optionen für Dropdowns (immer aus Gesamt-Tabelle) ──
+        // ── 4. Kategorische Optionen für Dropdowns (immer aus Gesamt-Tabelle) ──
         $categorical = [];
         foreach ($field_cols as $col) {
             $vals = [];
@@ -577,10 +675,10 @@ class CF7_SQLite_Store {
             }
         }
 
-        // ── 4. WHERE bauen ──
+        // ── 5. WHERE bauen ──
         [$where_sql, $where_params] = $this->build_where($field_cols, $all_cols, $filters, $search);
 
-        // ── 5. Gesamt-Treffer zählen ──
+        // ── 6. Gesamt-Treffer zählen ──
         $count_stmt = $db->prepare("SELECT COUNT(*) FROM \"$table\" $where_sql");
         foreach ($where_params as $k => $v) $count_stmt->bindValue($k, $v);
         $total       = (int) $count_stmt->execute()->fetchArray()[0];
@@ -588,7 +686,7 @@ class CF7_SQLite_Store {
         $paged       = min($paged, $total_pages);
         $offset      = ($paged - 1) * self::PER_PAGE;
 
-        // ── 6. Aktuelle Seite laden ──
+        // ── 7. Aktuelle Seite laden ──
         $row_stmt = $db->prepare("SELECT * FROM \"$table\" $where_sql ORDER BY id DESC LIMIT :lim OFFSET :off");
         foreach ($where_params as $k => $v) $row_stmt->bindValue($k, $v);
         $row_stmt->bindValue(':lim', self::PER_PAGE, SQLITE3_INTEGER);
@@ -597,8 +695,9 @@ class CF7_SQLite_Store {
         $res  = $row_stmt->execute();
         while ($r = $res->fetchArray(SQLITE3_ASSOC)) $rows[] = $r;
 
-        // ── 7. Nonce: einmal erzeugen, per Zeile wiederverwenden ──
+        // ── 8. Nonces: einmal erzeugen, per Zeile wiederverwenden ──
         $status_nonce = wp_create_nonce('fs_status');
+        $col_nonce    = wp_create_nonce('fs_col_settings');
 
         // Basis-URL für Pagination & Reset (ohne paged/s/filter)
         $base_url = admin_url('admin.php?page=formular-daten&form=' . urlencode($table));
@@ -671,20 +770,63 @@ class CF7_SQLite_Store {
                 ?>
             </span>
 
-            <!-- Export-Formular (eigenständig, trägt aktive Filter mit) -->
-            <form method="post" action="<?php echo esc_url(admin_url('admin-post.php')); ?>" style="margin-left:auto">
-                <?php wp_nonce_field('fs_export'); ?>
-                <input type="hidden" name="action" value="fs_export">
-                <input type="hidden" name="table"  value="<?php echo esc_attr($table); ?>">
-                <?php if ($search !== ''): ?>
-                <input type="hidden" name="s" value="<?php echo esc_attr($search); ?>">
-                <?php endif; ?>
-                <?php foreach ($filters as $col => $val): if ($val === '') continue; ?>
-                <input type="hidden" name="filter[<?php echo esc_attr($col); ?>]" value="<?php echo esc_attr($val); ?>">
-                <?php endforeach; ?>
-                <button class="button" type="submit">⬇ CSV Export<?php echo $has_filters ? ' (gefiltert)' : ''; ?></button>
-            </form>
+            <div style="margin-left:auto;display:flex;gap:8px;align-items:center">
+
+                <!-- Export-Formular (eigenständig, trägt aktive Filter mit) -->
+                <form method="post" action="<?php echo esc_url(admin_url('admin-post.php')); ?>">
+                    <?php wp_nonce_field('fs_export'); ?>
+                    <input type="hidden" name="action" value="fs_export">
+                    <input type="hidden" name="table"  value="<?php echo esc_attr($table); ?>">
+                    <?php if ($search !== ''): ?>
+                    <input type="hidden" name="s" value="<?php echo esc_attr($search); ?>">
+                    <?php endif; ?>
+                    <?php foreach ($filters as $col => $val): if ($val === '') continue; ?>
+                    <input type="hidden" name="filter[<?php echo esc_attr($col); ?>]" value="<?php echo esc_attr($val); ?>">
+                    <?php endforeach; ?>
+                    <button class="button" type="submit">⬇ CSV<?php echo $has_filters ? ' (gefiltert)' : ''; ?></button>
+                </form>
+
+                <!-- Spalten-Einstellungen -->
+                <div style="position:relative">
+                    <button id="fs-cols-btn" type="button" class="button">☰ Spalten</button>
+                    <div id="fs-cols-panel" style="display:none;position:absolute;top:calc(100% + 6px);right:0;background:#fff;border:1px solid #dcdcde;border-radius:8px;padding:12px;z-index:200;min-width:220px;box-shadow:0 4px 16px rgba(0,0,0,.12)">
+                        <div style="font-size:11px;text-transform:uppercase;letter-spacing:.5px;color:#646970;font-weight:600;margin-bottom:8px">Spalten verwalten</div>
+                        <ul id="fs-cols-list" style="list-style:none;margin:0;padding:0;max-height:320px;overflow-y:auto">
+                            <?php foreach ($all_display as $col):
+                                $is_hidden = in_array($col, $hidden_cols, true);
+                            ?>
+                            <li draggable="true"
+                                data-col="<?php echo esc_attr($col); ?>"
+                                data-hidden="<?php echo $is_hidden ? '1' : '0'; ?>"
+                                style="display:flex;align-items:center;gap:8px;padding:7px 2px;border-bottom:1px solid #f0f0f1;cursor:default">
+                                <span style="cursor:grab;color:#c3c4c7;font-size:17px;line-height:1;flex-shrink:0" title="Ziehen zum Sortieren">⠿</span>
+                                <span class="fs-col-label" style="flex:1;font-size:13px;<?php echo $is_hidden ? 'opacity:.35;text-decoration:line-through' : ''; ?>">
+                                    <?php echo esc_html($this->col_label($col)); ?>
+                                </span>
+                                <button class="fs-eye" type="button" title="<?php echo $is_hidden ? 'Einblenden' : 'Ausblenden'; ?>"
+                                    style="background:none;border:none;cursor:pointer;font-size:14px;padding:0 2px;line-height:1;opacity:<?php echo $is_hidden ? '.25' : '.65'; ?>;flex-shrink:0">👁</button>
+                            </li>
+                            <?php endforeach; ?>
+                        </ul>
+                        <p style="font-size:11px;color:#a7aaad;margin:8px 0 0;text-align:center">↕ Ziehen zum Sortieren</p>
+                    </div>
+                </div>
+
+            </div>
         </div>
+
+        <?php if (!empty($hidden_display)): ?>
+        <!-- Pills für versteckte Spalten -->
+        <div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin-bottom:8px">
+            <span style="font-size:11px;color:#a7aaad;flex-shrink:0">Versteckt:</span>
+            <?php foreach ($hidden_display as $col): ?>
+            <button class="fs-show-col" type="button" data-col="<?php echo esc_attr($col); ?>"
+                style="background:#f6f7f7;border:1px solid #dcdcde;border-radius:20px;padding:2px 10px;font-size:11px;cursor:pointer;color:#646970;line-height:1.8">
+                + <?php echo esc_html($this->col_label($col)); ?>
+            </button>
+            <?php endforeach; ?>
+        </div>
+        <?php endif; ?>
 
         <!-- Tabelle -->
         <div style="overflow-x:auto">
@@ -698,13 +840,12 @@ class CF7_SQLite_Store {
                         <span class="fs-arrow" style="margin-left:4px;opacity:.4">↕</span>
                     </th>
                     <?php endforeach; ?>
-                    <th style="padding:10px 14px;width:120px"></th>
                 </tr>
             </thead>
             <tbody>
             <?php if (empty($rows)): ?>
             <tr>
-                <td colspan="<?php echo count($display_cols) + 1; ?>"
+                <td colspan="<?php echo count($display_cols); ?>"
                     style="padding:40px;text-align:center;color:#646970">
                     Keine Einträge gefunden<?php echo $has_filters ? ' — <a href="' . esc_url($base_url) . '">Filter zurücksetzen</a>' : ''; ?>
                 </td>
@@ -718,10 +859,20 @@ class CF7_SQLite_Store {
                 <?php foreach ($display_cols as $col):
                     $val = $row[$col] ?? '';
                     if ($col === '_status'): ?>
-                        <td style="padding:9px 14px">
-                            <span style="background:<?php echo $sc; ?>;color:#fff;padding:3px 10px;border-radius:20px;font-size:11px;font-weight:600;white-space:nowrap">
-                                <?php echo esc_html($val); ?>
-                            </span>
+                        <!-- Status-Badge ist gleichzeitig das Änderungs-Dropdown -->
+                        <td style="padding:9px 14px;white-space:nowrap">
+                            <form method="post" action="<?php echo esc_url(admin_url('admin-post.php')); ?>" style="margin:0">
+                                <input type="hidden" name="_wpnonce" value="<?php echo esc_attr($status_nonce); ?>">
+                                <input type="hidden" name="action" value="fs_status">
+                                <input type="hidden" name="table"  value="<?php echo esc_attr($table); ?>">
+                                <input type="hidden" name="id"     value="<?php echo (int) $row['id']; ?>">
+                                <select name="status" onchange="this.form.submit()"
+                                    style="background:<?php echo $sc; ?>;color:#fff;border:none;outline:none;padding:3px 8px;border-radius:20px;font-size:11px;font-weight:600;cursor:pointer;appearance:none;-webkit-appearance:none">
+                                    <?php foreach ($this->statuses as $s): ?>
+                                    <option value="<?php echo esc_attr($s); ?>" <?php selected($val, $s); ?>><?php echo esc_html($s); ?></option>
+                                    <?php endforeach; ?>
+                                </select>
+                            </form>
                         </td>
                     <?php elseif ($col === '_created_at'): ?>
                         <td style="padding:9px 14px;white-space:nowrap;color:#555"><?php echo esc_html($val); ?></td>
@@ -729,22 +880,6 @@ class CF7_SQLite_Store {
                         <td style="padding:9px 14px"><?php echo nl2br(esc_html($val)); ?></td>
                     <?php endif;
                 endforeach; ?>
-
-                <!-- Status ändern -->
-                <td style="padding:9px 14px;white-space:nowrap">
-                    <form method="post" action="<?php echo esc_url(admin_url('admin-post.php')); ?>" style="display:inline">
-                        <input type="hidden" name="_wpnonce" value="<?php echo esc_attr($status_nonce); ?>">
-                        <input type="hidden" name="action" value="fs_status">
-                        <input type="hidden" name="table"  value="<?php echo esc_attr($table); ?>">
-                        <input type="hidden" name="id"     value="<?php echo (int) $row['id']; ?>">
-                        <select name="status" onchange="this.form.submit()"
-                            style="padding:3px 6px;border:1px solid #c3c4c7;border-radius:4px;font-size:12px;cursor:pointer">
-                            <?php foreach ($this->statuses as $s): ?>
-                            <option value="<?php echo esc_attr($s); ?>" <?php selected($row['_status'], $s); ?>><?php echo esc_html($s); ?></option>
-                            <?php endforeach; ?>
-                        </select>
-                    </form>
-                </td>
             </tr>
             <?php endforeach; ?>
             <?php endif; ?>
@@ -773,21 +908,96 @@ class CF7_SQLite_Store {
 
         <script>
         (function () {
-            const rows  = Array.from(document.querySelectorAll('#fs-table .fs-row'));
-            const tbody = document.querySelector('#fs-table tbody');
-            if (!rows.length) return;
+            // ── Spalten-Panel ────────────────────────────────────────────────────
+            const COL_NONCE = <?php echo json_encode($col_nonce); ?>;
+            const FS_TABLE  = <?php echo json_encode($table); ?>;
+            const panel     = document.getElementById('fs-cols-panel');
+            const colsBtn   = document.getElementById('fs-cols-btn');
+            const colsList  = document.getElementById('fs-cols-list');
 
-            // ── Spalten-Sortierung (innerhalb der aktuellen Seite) ──
+            // Öffnen / Schließen
+            colsBtn?.addEventListener('click', e => {
+                e.stopPropagation();
+                panel.style.display = panel.style.display === 'none' ? 'block' : 'none';
+            });
+            document.addEventListener('click', () => { if (panel) panel.style.display = 'none'; });
+            panel?.addEventListener('click', e => e.stopPropagation());
+
+            // Einstellungen per AJAX speichern und Seite neu laden
+            function saveAndReload() {
+                if (!colsList) return;
+                const items  = Array.from(colsList.querySelectorAll('li[data-col]'));
+                const order  = items.map(li => li.dataset.col);
+                const hidden = items.filter(li => li.dataset.hidden === '1').map(li => li.dataset.col);
+
+                const fd = new FormData();
+                fd.append('action',      'fs_col_settings');
+                fd.append('_ajax_nonce', COL_NONCE);
+                fd.append('table',       FS_TABLE);
+                order.forEach(c  => fd.append('order[]',  c));
+                hidden.forEach(c => fd.append('hidden[]', c));
+
+                if (colsBtn) { colsBtn.disabled = true; colsBtn.textContent = '…'; }
+
+                fetch(ajaxurl, { method: 'POST', body: fd })
+                    .then(r => r.json())
+                    .then(r => { if (r.success) location.reload(); })
+                    .catch(() => {
+                        if (colsBtn) { colsBtn.disabled = false; colsBtn.textContent = '☰ Spalten'; }
+                    });
+            }
+
+            // Auge-Icon: Sichtbarkeit umschalten
+            colsList?.querySelectorAll('.fs-eye').forEach(btn => {
+                btn.addEventListener('click', e => {
+                    e.stopPropagation();
+                    const li = btn.closest('li');
+                    li.dataset.hidden = li.dataset.hidden === '1' ? '0' : '1';
+                    saveAndReload();
+                });
+            });
+
+            // Pills: versteckte Spalte wieder einblenden
+            document.querySelectorAll('.fs-show-col').forEach(btn => {
+                btn.addEventListener('click', () => {
+                    const li = colsList?.querySelector('[data-col="' + btn.dataset.col + '"]');
+                    if (li) { li.dataset.hidden = '0'; saveAndReload(); }
+                });
+            });
+
+            // ── Drag & Drop (HTML5 nativ) ────────────────────────────────────────
+            let dragSrc = null;
+
+            colsList?.addEventListener('dragstart', e => {
+                dragSrc = e.target.closest('li');
+                if (!dragSrc) return;
+                e.dataTransfer.effectAllowed = 'move';
+                setTimeout(() => { if (dragSrc) dragSrc.style.opacity = '.4'; }, 0);
+            });
+
+            colsList?.addEventListener('dragover', e => {
+                e.preventDefault();
+                e.dataTransfer.dropEffect = 'move';
+                const target = e.target.closest('li');
+                if (!target || target === dragSrc || !dragSrc) return;
+                const after = e.clientY > target.getBoundingClientRect().top + target.offsetHeight / 2;
+                colsList.insertBefore(dragSrc, after ? target.nextSibling : target);
+            });
+
+            colsList?.addEventListener('dragend', () => {
+                if (dragSrc) { dragSrc.style.opacity = '1'; dragSrc = null; }
+                saveAndReload();
+            });
+
+            // ── Spalten-Sortierung (innerhalb der aktuellen Seite) ────────────────
+            const sortRows  = Array.from(document.querySelectorAll('#fs-table .fs-row'));
+            const sortTbody = document.querySelector('#fs-table tbody');
             let sortCol = -1, sortAsc = true;
 
             document.querySelectorAll('#fs-table th.fs-sortable').forEach(th => {
                 th.addEventListener('click', () => {
                     const idx = parseInt(th.dataset.sortIdx, 10);
-                    if (sortCol === idx) {
-                        sortAsc = !sortAsc;
-                    } else {
-                        sortCol = idx; sortAsc = true;
-                    }
+                    if (sortCol === idx) { sortAsc = !sortAsc; } else { sortCol = idx; sortAsc = true; }
 
                     document.querySelectorAll('#fs-table th.fs-sortable .fs-arrow').forEach(a => {
                         a.textContent = '↕'; a.style.opacity = '.4';
@@ -796,12 +1006,12 @@ class CF7_SQLite_Store {
                     arrow.textContent = sortAsc ? '↑' : '↓';
                     arrow.style.opacity = '1';
 
-                    rows.sort((a, b) => {
+                    sortRows.sort((a, b) => {
                         const av = a.cells[idx] ? a.cells[idx].textContent.trim() : '';
                         const bv = b.cells[idx] ? b.cells[idx].textContent.trim() : '';
                         return sortAsc ? av.localeCompare(bv, 'de') : bv.localeCompare(av, 'de');
                     });
-                    rows.forEach(r => tbody.appendChild(r));
+                    sortRows.forEach(r => sortTbody.appendChild(r));
                 });
             });
         })();

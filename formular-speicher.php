@@ -641,10 +641,8 @@ class CF7_SQLite_Store {
             $all_display = array_merge($saved_order, $new_cols);
         }
 
-        // Sichtbare Spalten (ohne versteckte) → für die Tabelle
-        $display_cols   = array_values(array_filter($all_display, fn($c) => !in_array($c, $hidden_cols, true)));
-        // Versteckte Spalten → für die Pills
-        $hidden_display = array_values(array_filter($all_display, fn($c) => in_array($c, $hidden_cols, true)));
+        // Sichtbare Spalten (ohne versteckte) → für Tabelle und Filter
+        $display_cols = array_values(array_filter($all_display, fn($c) => !in_array($c, $hidden_cols, true)));
 
         // ── 3. GET-Parameter einlesen & validieren ──
         $search = sanitize_text_field($_GET['s'] ?? '');
@@ -817,18 +815,6 @@ class CF7_SQLite_Store {
             </div>
         </div>
 
-        <?php if (!empty($hidden_display)): ?>
-        <!-- Pills für versteckte Spalten -->
-        <div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin-bottom:8px">
-            <span style="font-size:11px;color:#a7aaad;flex-shrink:0">Versteckt:</span>
-            <?php foreach ($hidden_display as $col): ?>
-            <button class="fs-show-col" type="button" data-col="<?php echo esc_attr($col); ?>"
-                style="background:#f6f7f7;border:1px solid #dcdcde;border-radius:20px;padding:2px 10px;font-size:11px;cursor:pointer;color:#646970;line-height:1.8">
-                + <?php echo esc_html($this->col_label($col)); ?>
-            </button>
-            <?php endforeach; ?>
-        </div>
-        <?php endif; ?>
 
         <!-- Tabelle -->
         <div style="overflow-x:auto">
@@ -950,14 +936,6 @@ class CF7_SQLite_Store {
                     const li = btn.closest('li');
                     li.dataset.hidden = li.dataset.hidden === '1' ? '0' : '1';
                     saveAndReload();
-                });
-            });
-
-            // Pills: versteckte Spalte wieder einblenden
-            document.querySelectorAll('.fs-show-col').forEach(btn => {
-                btn.addEventListener('click', () => {
-                    const li = colsList?.querySelector('[data-col="' + btn.dataset.col + '"]');
-                    if (li) { li.dataset.hidden = '0'; saveAndReload(); }
                 });
             });
 

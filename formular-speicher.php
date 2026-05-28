@@ -663,9 +663,11 @@ class CF7_SQLite_Store {
 
         $has_filters = $search !== '' || count(array_filter($filters)) > 0;
 
-        // ── 4. Kategorische Optionen für Dropdowns (immer aus Gesamt-Tabelle) ──
+        // ── 4. Kategorische Optionen für Dropdowns ──
+        // Iteriert über $display_cols → Reihenfolge und Sichtbarkeit aus den Einstellungen
         $categorical = [];
-        foreach ($field_cols as $col) {
+        foreach ($display_cols as $col) {
+            if (in_array($col, ['_created_at', '_status'], true)) continue;
             $vals = [];
             $q = $db->query("SELECT DISTINCT \"$col\" AS v FROM \"$table\" WHERE \"$col\" IS NOT NULL AND \"$col\" != '' LIMIT 16");
             while ($r = $q->fetchArray(SQLITE3_ASSOC)) $vals[] = $r['v'];
@@ -741,6 +743,7 @@ class CF7_SQLite_Store {
             </select>
             <?php endforeach; ?>
 
+            <?php if (in_array('_status', $display_cols, true)): ?>
             <select form="<?php echo $fid; ?>" name="filter[_status]"
                 onchange="document.getElementById('<?php echo $fid; ?>').submit()"
                 style="padding:7px;border:1px solid #c3c4c7;border-radius:5px;font-size:13px">
@@ -749,6 +752,7 @@ class CF7_SQLite_Store {
                 <option value="<?php echo esc_attr($s); ?>" <?php selected($filters['_status'] ?? '', $s); ?>><?php echo esc_html($s); ?></option>
                 <?php endforeach; ?>
             </select>
+            <?php endif; ?>
 
             <button type="submit" form="<?php echo $fid; ?>" class="button">Suchen</button>
 

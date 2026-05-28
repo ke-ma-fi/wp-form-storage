@@ -42,9 +42,9 @@ Open the form in the CF7 editor and uncheck **Submissions speichern** in the **S
 ### Managing columns
 
 Click **☰ Spalten** in the toolbar to open the column manager:
+
 - Drag the **⠿** handle to reorder columns
 - Click **👁** to show or hide a column
-- Hidden columns appear as pills below the toolbar — click to restore
 
 Settings are saved globally (all users see the same layout).
 
@@ -54,7 +54,7 @@ Click **⬇ CSV** to download a CSV of the current view. Active filters are appl
 
 ## Data storage
 
-```
+```text
 wp-content/uploads/formular-speicher/
 ├── submissions.sqlite   # all form data
 ├── .htaccess            # blocks direct web access

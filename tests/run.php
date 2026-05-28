@@ -228,7 +228,7 @@ try {
     $display    = array_values(array_filter($ordered, fn($c) => !in_array($c, $hidden_c, true)));
     $hidden_vis = array_values(array_filter($ordered, fn($c) =>  in_array($c, $hidden_c, true)));
     eq('Display: hidden entfernt',      $display,    ['_status', '_created_at']);
-    eq('Pills: nur hidden sichtbar',    $hidden_vis, ['email', 'nachricht']);
+    eq('hidden_vis: nur versteckte',    $hidden_vis, ['email', 'nachricht']);
 
     // build_where-Ergebnis führt zu korrekten SQL-Abfragen
     $db->exec("INSERT INTO \"test_form\" (email, nachricht, _status) VALUES ('a@b.de', 'Hallo', 'Neu')");

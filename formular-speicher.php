@@ -39,7 +39,7 @@ class CF7_SQLite_Store {
 
         // Admin
         add_action('admin_menu',                [$this, 'add_menu']);
-        add_action('admin_post_fs_status',      [$this, 'handle_status']);
+        add_action('wp_ajax_fs_update_status',  [$this, 'handle_status_ajax']);
         add_action('admin_post_fs_export',      [$this, 'handle_export']);
         add_action('wp_ajax_fs_col_settings',   [$this, 'handle_col_settings']);
     }
@@ -472,21 +472,24 @@ class CF7_SQLite_Store {
        AKTIONEN (Status / Export)
     ════════════════════════════════════════════════ */
 
-    public function handle_status(): void {
-        check_admin_referer('fs_status');
-        if (!current_user_can('fs_view_submissions')) wp_die('Keine Berechtigung.');
+    public function handle_status_ajax(): void {
+        check_ajax_referer('fs_status');
+        if (!current_user_can('fs_view_submissions')) wp_die('', '', ['response' => 403]);
 
         $table  = sanitize_text_field($_POST['table']  ?? '');
         $id     = (int) ($_POST['id'] ?? 0);
         $status = sanitize_text_field($_POST['status'] ?? '');
 
-        if ($this->is_known_table($table) && $id && in_array($status, $this->statuses, true)) {
-            $stmt = $this->db()->prepare("UPDATE \"$table\" SET _status=:s WHERE id=:id");
-            $stmt->bindValue(':s', $status);
-            $stmt->bindValue(':id', $id, SQLITE3_INTEGER);
-            $stmt->execute();
+        if (!$this->is_known_table($table) || !$id || !in_array($status, $this->statuses, true)) {
+            wp_send_json_error();
         }
-        $this->redirect_back($table);
+
+        $stmt = $this->db()->prepare("UPDATE \"$table\" SET _status=:s WHERE id=:id");
+        $stmt->bindValue(':s', $status);
+        $stmt->bindValue(':id', $id, SQLITE3_INTEGER);
+        $stmt->execute();
+
+        wp_send_json_success(['color' => $this->status_colors[$status] ?? '#999']);
     }
 
     public function handle_export(): void {
@@ -531,11 +534,6 @@ class CF7_SQLite_Store {
             fputcsv($out, array_values($row), ';');
         }
         fclose($out);
-        exit;
-    }
-
-    private function redirect_back(string $table): void {
-        wp_safe_redirect(admin_url('admin.php?page=formular-daten&form=' . urlencode($table)));
         exit;
     }
 
@@ -863,20 +861,14 @@ class CF7_SQLite_Store {
                 <?php foreach ($display_cols as $col):
                     $val = $row[$col] ?? '';
                     if ($col === '_status'): ?>
-                        <!-- Status-Badge ist gleichzeitig das Änderungs-Dropdown -->
                         <td style="padding:9px 14px;white-space:nowrap">
-                            <form method="post" action="<?php echo esc_url(admin_url('admin-post.php')); ?>" style="margin:0">
-                                <input type="hidden" name="_wpnonce" value="<?php echo esc_attr($status_nonce); ?>">
-                                <input type="hidden" name="action" value="fs_status">
-                                <input type="hidden" name="table"  value="<?php echo esc_attr($table); ?>">
-                                <input type="hidden" name="id"     value="<?php echo (int) $row['id']; ?>">
-                                <select name="status" onchange="this.form.submit()"
-                                    style="background:<?php echo $sc; ?>;color:#fff;border:none;outline:none;padding:3px 8px;border-radius:20px;font-size:11px;font-weight:600;cursor:pointer;appearance:none;-webkit-appearance:none">
-                                    <?php foreach ($this->statuses as $s): ?>
-                                    <option value="<?php echo esc_attr($s); ?>" <?php selected($val, $s); ?>><?php echo esc_html($s); ?></option>
-                                    <?php endforeach; ?>
-                                </select>
-                            </form>
+                            <select class="fs-status-select"
+                                data-id="<?php echo (int) $row['id']; ?>"
+                                style="background:<?php echo $sc; ?>;color:#fff;border:none;outline:none;padding:3px 8px;border-radius:20px;font-size:11px;font-weight:600;cursor:pointer;appearance:none;-webkit-appearance:none">
+                                <?php foreach ($this->statuses as $s): ?>
+                                <option value="<?php echo esc_attr($s); ?>" <?php selected($val, $s); ?>><?php echo esc_html($s); ?></option>
+                                <?php endforeach; ?>
+                            </select>
                         </td>
                     <?php elseif ($col === '_created_at'): ?>
                         <td style="padding:9px 14px;white-space:nowrap;color:#555"><?php echo esc_html($val); ?></td>
@@ -991,6 +983,48 @@ class CF7_SQLite_Store {
             colsList?.addEventListener('dragend', () => {
                 if (dragSrc) { dragSrc.style.opacity = '1'; dragSrc = null; }
                 saveAndReload();
+            });
+
+            // ── Status-Änderung via AJAX ─────────────────────────────────────────
+            const STATUS_NONCE  = <?php echo json_encode($status_nonce); ?>;
+            const STATUS_COLORS = <?php echo json_encode($this->status_colors); ?>;
+
+            document.querySelectorAll('.fs-status-select').forEach(sel => {
+                let prevValue = sel.value;
+                sel.addEventListener('focus', function () { prevValue = this.value; });
+
+                sel.addEventListener('change', function () {
+                    const newStatus = this.value;
+                    const prevColor = STATUS_COLORS[prevValue] || '#999';
+                    const newColor  = STATUS_COLORS[newStatus] || '#999';
+
+                    this.style.background = newColor; // optimistisches Update
+                    this.disabled = true;
+
+                    const fd = new FormData();
+                    fd.append('action',      'fs_update_status');
+                    fd.append('_ajax_nonce', STATUS_NONCE);
+                    fd.append('table',       FS_TABLE);
+                    fd.append('id',          this.dataset.id);
+                    fd.append('status',      newStatus);
+
+                    fetch(ajaxurl, { method: 'POST', body: fd })
+                        .then(r => r.json())
+                        .then(r => {
+                            this.disabled = false;
+                            if (r.success) {
+                                prevValue = newStatus;
+                            } else {
+                                this.value = prevValue;
+                                this.style.background = prevColor;
+                            }
+                        })
+                        .catch(() => {
+                            this.disabled = false;
+                            this.value = prevValue;
+                            this.style.background = prevColor;
+                        });
+                });
             });
 
             // ── Spalten-Sortierung (innerhalb der aktuellen Seite) ────────────────
